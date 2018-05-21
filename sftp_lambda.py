@@ -8,8 +8,6 @@ import pprint
 import time
 import subprocess
 
-# Function definition is here
-
 
 def ami(primary_region, dr_region, key):
     ec = boto3.client('ec2', region_name=primary_region)
