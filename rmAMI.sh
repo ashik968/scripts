@@ -1,44 +1,52 @@
 #!/bin/bash
-#Script to remove AMIs with some tags older than 7 days and its associated snapshots.
-ami () {
-time=`aws ec2 describe-images --image-ids $ami_id --query 'Images[*].[ImageId,CreationDate]' --output text | awk '{ print $2 }'`
+# Script to remove AMIs with specific tags older than 7 days along with associated snapshots
 
-time1=`echo $time | head -c 10`
+set -euo pipefail
 
-compdate=`date '+%Y-%m-%d' --date='6 days ago'`
+# Define a function to delete AMIs older than 7 days
+delete_old_ami() {
+    local ami_id="$1"
+    local creation_date
+    creation_date=$(aws ec2 describe-images --image-ids "$ami_id" --query 'Images[0].CreationDate' --output text | cut -d'T' -f1)
 
-flag=$(echo $(( ( $(date -ud $time1 +'%s') - $(date -ud $compdate +'%s') )/60/60/24 )))
+    local threshold_date
+    threshold_date=$(date -d '7 days ago' +%F)
 
-echo "flag=$flag"
+    echo "Checking AMI: $ami_id (created on $creation_date)"
 
-if [[ "$compdate" > "$time1" ]];
+    if [[ "$creation_date" < "$threshold_date" ]]; then
+        echo "AMI $ami_id is older than 7 days. Proceeding with deregistration."
 
-  then
-        my_array=( $(aws ec2 describe-images --image-ids $ami_id --output text --query 'Images[*].BlockDeviceMappings[*].Ebs.SnapshotId') )
-        echo "my_array=$my_array"
-        echo "older than 7 days"
-        echo "deregistering old image $ami_id"
-        aws ec2 deregister-image --image-id $ami_id
-        echo "my_array=$my_array"
-        my_array_length=${#my_array[@]}
-        echo "Removing Snapshot"
-        for (( i=0; i<$my_array_length; i++ ))
-        do
-                temp_snapshot_id=${my_array[$i]}
-                echo "Deleting Snapshot: $temp_snapshot_id"
-                aws ec2 delete-snapshot --snapshot-id $temp_snapshot_id
+        # Get associated snapshot IDs
+        snapshot_ids=($(aws ec2 describe-images --image-ids "$ami_id" --query 'Images[*].BlockDeviceMappings[*].Ebs.SnapshotId' --output text))
+
+        # Deregister the AMI
+        aws ec2 deregister-image --image-id "$ami_id"
+        echo "Deregistered AMI: $ami_id"
+
+        # Delete associated snapshots
+        for snapshot_id in "${snapshot_ids[@]}"; do
+            echo "Deleting snapshot: $snapshot_id"
+            aws ec2 delete-snapshot --snapshot-id "$snapshot_id"
         done
-fi
-
+    else
+        echo "AMI $ami_id is not older than 7 days. Skipping."
+    fi
 }
 
-owner_id=`aws ec2 describe-security-groups --group-names 'Default' --query 'SecurityGroups[0].OwnerId' --output text`
-#Get all AMI IDs with some tags
-aws ec2 describe-images --owners $owner_id --filters "Name=tag-value,Values=<some_tags>" --output text --query 'Images[*].{ID:ImageId}' > /root/scripts/AMI/amiid.txt
-filename="/tmp/amiid.txt"
-while read -r line
-do
-    ami_id="$line"
-    echo "Name read from file - $ami_id"
-    ami
-done < "$filename"
+# Main logic
+owner_id=$(aws sts get-caller-identity --query 'Account' --output text)
+
+# Get list of AMI IDs with specific tag values
+ami_list_file="/tmp/amiid.txt"
+aws ec2 describe-images \
+    --owners "$owner_id" \
+    --filters "Name=tag-value,Values=<some_tags>" \
+    --query 'Images[*].ImageId' \
+    --output text > "$ami_list_file"
+
+# Read each AMI ID and process
+while read -r ami_id; do
+    [[ -z "$ami_id" ]] && continue
+    delete_old_ami "$ami_id"
+done < "$ami_list_file"
