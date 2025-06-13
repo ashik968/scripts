@@ -6,7 +6,7 @@ Connecting to EC2 instances via AWS Systems Manager (SSM) can often be time-cons
 
 ## ✅ Solution
 
-To address this inefficiency, we've developed a lightweight command-line utility called **`aws-ec2-connector`**. This tool simplifies and accelerates the process of connecting to EC2 instances by leveraging your AWS SSO session. It automates instance discovery and session initiation, enabling faster, error-free access.
+To address this inefficiency, developed a lightweight command-line utility called **`aws-ec2-connector`**. This tool simplifies and accelerates the process of connecting to EC2 instances by leveraging your AWS SSO session. It automates instance discovery and session initiation, enabling faster, error-free access.
 
 ---
 
