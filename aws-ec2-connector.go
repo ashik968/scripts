@@ -14,7 +14,10 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"runtime"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -37,7 +40,7 @@ type InstanceInfo struct {
 type instanceSelectorModel struct {
 	instances []InstanceInfo
 	cursor    int
-	selected  *InstanceInfo
+	selected  map[int]struct{}
 }
 
 func (m instanceSelectorModel) Init() tea.Cmd {
@@ -58,56 +61,92 @@ func (m instanceSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if m.cursor < len(m.instances)-1 {
 				m.cursor++
 			}
-		case "enter":
-			if m.cursor >= 0 && m.cursor < len(m.instances) {
-				m.selected = &m.instances[m.cursor]
-				return m, tea.Quit
+		case " ":
+			_, ok := m.selected[m.cursor]
+			if ok {
+				delete(m.selected, m.cursor)
+			} else {
+				m.selected[m.cursor] = struct{}{}
 			}
+		case "enter":
+			return m, tea.Quit
 		}
 	}
 	return m, nil
 }
 
 func (m instanceSelectorModel) View() string {
-	s := "📋 Select an EC2 Instance (Use ↑/↓ to navigate, Enter to select, q to quit):\n\n"
+	s := "📋 Select instances (space to toggle, enter to confirm, q to quit):\n\n"
 	for i, inst := range m.instances {
 		cursor := " "
 		if m.cursor == i {
 			cursor = ">"
 		}
+
+		checked := " "
+		if _, ok := m.selected[i]; ok {
+			checked = "x"
+		}
+
 		platform := "Linux"
 		if inst.Platform != "" {
 			platform = inst.Platform
 		}
-		s += fmt.Sprintf("%s [%d] %-20s | %s | %s | %s\n", cursor, i+1, inst.Name, inst.ID, inst.PrivateIP, platform)
+		s += fmt.Sprintf("%s [%s] %-20s | %s | %s | %s\n", cursor, checked, inst.Name, inst.ID, inst.PrivateIP, platform)
 	}
 	return s
 }
 
-func selectInstance(instances []InstanceInfo) (*InstanceInfo, error) {
-	m := instanceSelectorModel{instances: instances}
+func selectInstances(instances []InstanceInfo) ([]InstanceInfo, error) {
+	m := instanceSelectorModel{
+		instances: instances,
+		selected:  make(map[int]struct{}),
+	}
 	p := tea.NewProgram(m)
 	finalModel, err := p.Run()
 	if err != nil {
 		return nil, fmt.Errorf("TUI failed: %v", err)
 	}
 	m = finalModel.(instanceSelectorModel)
-	if m.selected == nil {
-		return nil, fmt.Errorf("no instance selected")
+
+	var selectedInstances []InstanceInfo
+	for i := range m.selected {
+		selectedInstances = append(selectedInstances, m.instances[i])
 	}
-	return m.selected, nil
+
+	if len(selectedInstances) == 0 {
+		return nil, fmt.Errorf("no instances selected")
+	}
+
+	return selectedInstances, nil
 }
 
 func main() {
 	region := flag.String("region", "ap-northeast-1", "AWS region (default: Tokyo)")
+	profile := flag.String("profile", "", "AWS profile to use")
+	rdpPort := flag.String("rdp-port", "9000", "Local port for RDP connection")
+	tags := flag.String("tags", "", "Comma-separated tags to filter instances (e.g., 'Name=web-server,Env=prod')")
+	pemKeyPath := flag.String("pem-key-path", "", "Path to PEM private key for Windows instances")
 	flag.Parse()
 
-	cfg, err := config.LoadDefaultConfig(context.TODO(), config.WithRegion(*region))
+	opts := []func(*config.LoadOptions) error{
+		config.WithRegion(*region),
+	}
+	if *profile != "" {
+		opts = append(opts, config.WithSharedConfigProfile(*profile))
+	}
+
+	cfg, err := config.LoadDefaultConfig(context.TODO(), opts...)
 	if err != nil {
 		log.Fatalf("❌ Unable to load AWS config: %v", err)
 	}
 
-	instances, err := listRunningInstances(cfg)
+	tagFilters, err := parseTags(*tags)
+	if err != nil {
+		log.Fatalf("❌ Invalid tags format: %v", err)
+	}
+
+	instances, err := listRunningInstances(cfg, tagFilters)
 	if err != nil {
 		log.Fatalf("❌ Failed to list instances: %v", err)
 	}
@@ -116,42 +155,111 @@ func main() {
 		log.Fatal("🚫 No running EC2 instances found in this region.")
 	}
 
-	selected, err := selectInstance(instances)
+	selected, err := selectInstances(instances)
 	if err != nil {
-		log.Fatalf("❌ Failed to select instance: %v", err)
+		log.Fatalf("❌ Failed to select instances: %v", err)
 	}
 
-	boldPrint("✅ Selected instance: " + selected.Name + " (" + selected.ID + ")")
+	boldPrint(fmt.Sprintf("✅ Selected %d instance(s)", len(selected)))
 
-	if selected.Platform == "windows" {
-		fmt.Print("🔑 Enter full path to your Windows EC2 PEM private key: ")
-		keyPath := readLine()
-
-		password, err := getWindowsPassword(cfg, selected.ID, keyPath)
+	if len(selected) > 0 {
+		var wg sync.WaitGroup
+		rdpPortBase, err := strconv.Atoi(*rdpPort)
 		if err != nil {
-			log.Fatalf("❌ Failed to get Windows password: %v", err)
+			log.Fatalf("❌ Invalid rdp-port value: %s", *rdpPort)
+		}
+		windowsInstanceCount := 0
+
+		var keyPath string
+		containsWindows := false
+		for _, inst := range selected {
+			if inst.Platform == "windows" {
+				containsWindows = true
+				break
+			}
 		}
 
-		_ = copyToClipboard(password)
-		yellowBoldPrint("🔐 Windows Administrator password (copied to clipboard): " + password)
-
-		err = startPortForward(selected.ID, *region)
-
-	} else {
-		err = startShellSession(selected.ID, *region)
-	}
-
-	if err != nil {
-		// Only print the error if it's not the SSM agent not connected message
-		if !strings.Contains(err.Error(), "SSM agent not connected") {
-			log.Fatalf("❌ SSM session failed: %v", err)
+		if containsWindows {
+			if *pemKeyPath != "" {
+				keyPath = *pemKeyPath
+			} else {
+				fmt.Print("🔑 Enter full path to your Windows EC2 PEM private key: ")
+				keyPath = readLine()
+			}
 		}
-		// Otherwise, just exit (the user already saw the friendly message)
-		os.Exit(1)
+
+		for _, instance := range selected {
+			wg.Add(1)
+
+			portToUse := ""
+			if instance.Platform == "windows" {
+				portToUse = strconv.Itoa(rdpPortBase + windowsInstanceCount)
+				windowsInstanceCount++
+			}
+
+			go func(inst InstanceInfo, port string, keyPath string) {
+				defer wg.Done()
+
+				boldPrint("Initiating connection to instance: " + inst.Name + " (" + inst.ID + ")")
+				var sessionErr error
+				if inst.Platform == "windows" {
+					sessionErr = handleWindowsConnection(cfg, inst.ID, *region, port, keyPath)
+				} else {
+					sessionErr = handleLinuxConnection(inst.ID, *region)
+				}
+				if sessionErr != nil {
+					if !strings.Contains(sessionErr.Error(), "SSM agent not connected") {
+						log.Printf("❌ Session failed for %s: %v", inst.ID, sessionErr)
+					}
+				}
+			}(instance, portToUse, keyPath)
+		}
+		wg.Wait()
+		boldPrint("✅ All sessions terminated.")
 	}
 }
 
-func listRunningInstances(cfg aws.Config) ([]InstanceInfo, error) {
+func handleWindowsConnection(cfg aws.Config, instanceID, region, rdpPort, keyPath string) error {
+	password, err := getWindowsPassword(cfg, instanceID, keyPath)
+	if err != nil {
+		return fmt.Errorf("failed to get Windows password: %v", err)
+	}
+
+	_ = copyToClipboard(password)
+	yellowBoldPrint("🔐 Windows Administrator password for " + instanceID + " (copied to clipboard): " + password)
+
+	return startPortForward(instanceID, region, rdpPort)
+}
+
+func handleLinuxConnection(instanceID, region string) error {
+	return startShellSession(instanceID, region)
+}
+
+func parseTags(tagsStr string) ([]ec2types.Filter, error) {
+	if tagsStr == "" {
+		return nil, nil
+	}
+	var filters []ec2types.Filter
+	pairs := strings.Split(tagsStr, ",")
+	for _, pair := range pairs {
+		kv := strings.SplitN(pair, "=", 2)
+		if len(kv) != 2 {
+			return nil, fmt.Errorf("invalid tag format: %s. Expected key=value", pair)
+		}
+		key := strings.TrimSpace(kv[0])
+		value := strings.TrimSpace(kv[1])
+		if key == "" || value == "" {
+			return nil, fmt.Errorf("invalid tag format: %s. Key and value cannot be empty", pair)
+		}
+		filters = append(filters, ec2types.Filter{
+			Name:   aws.String("tag:" + key),
+			Values: []string{value},
+		})
+	}
+	return filters, nil
+}
+
+func listRunningInstances(cfg aws.Config, tagFilters []ec2types.Filter) ([]InstanceInfo, error) {
 	ec2Client := ec2.NewFromConfig(cfg)
 	ssmClient := ssm.NewFromConfig(cfg)
 
@@ -169,13 +277,17 @@ func listRunningInstances(cfg aws.Config) ([]InstanceInfo, error) {
 	}
 
 	// Get all running EC2 instances
-	out, err := ec2Client.DescribeInstances(context.TODO(), &ec2.DescribeInstancesInput{
-		Filters: []ec2types.Filter{
-			{
-				Name:   aws.String("instance-state-name"),
-				Values: []string{"running"},
-			},
+	filters := []ec2types.Filter{
+		{
+			Name:   aws.String("instance-state-name"),
+			Values: []string{"running"},
 		},
+	}
+	if tagFilters != nil {
+		filters = append(filters, tagFilters...)
+	}
+	out, err := ec2Client.DescribeInstances(context.TODO(), &ec2.DescribeInstancesInput{
+		Filters: filters,
 	})
 	if err != nil {
 		return nil, err
@@ -218,8 +330,7 @@ func listRunningInstances(cfg aws.Config) ([]InstanceInfo, error) {
 	return instances, nil
 }
 
-func startPortForward(instanceID, region string) error {
-	port := "9000"
+func startPortForward(instanceID, region, port string) error {
 	for {
 		if isPortInUse(port) {
 			fmt.Printf("❗ Port %s is already in use. Killing process using it...\n", port)
@@ -379,6 +490,15 @@ func decryptPassword(enc string, key *rsa.PrivateKey) (string, error) {
 }
 
 func startShellSession(instanceID, region string) error {
+	if runtime.GOOS == "darwin" {
+		script := fmt.Sprintf(`tell app "Terminal" to do script "aws ssm start-session --target %s --region %s"`, instanceID, region)
+		cmd := exec.Command("osascript", "-e", script)
+		return cmd.Run()
+	}
+
+	// For other OSes (Linux), run in the current terminal.
+	// Note: This will cause interleaved output if multiple sessions are started.
+	// A more advanced implementation could use `x-terminal-emulator` or other methods.
 	cmd := exec.Command("aws", "ssm", "start-session", "--target", instanceID, "--region", region)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
