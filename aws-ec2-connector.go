@@ -43,11 +43,11 @@ type instanceSelectorModel struct {
 	selected  map[int]struct{}
 }
 
-func (m instanceSelectorModel) Init() tea.Cmd {
+func (m *instanceSelectorModel) Init() tea.Cmd {
 	return nil
 }
 
-func (m instanceSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *instanceSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
 		switch msg.String() {
@@ -75,7 +75,7 @@ func (m instanceSelectorModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m instanceSelectorModel) View() string {
+func (m *instanceSelectorModel) View() string {
 	s := "📋 Select instances (space to toggle, enter to confirm, q to quit):\n\n"
 	for i, inst := range m.instances {
 		cursor := " "
@@ -98,7 +98,7 @@ func (m instanceSelectorModel) View() string {
 }
 
 func selectInstances(instances []InstanceInfo) ([]InstanceInfo, error) {
-	m := instanceSelectorModel{
+	m := &instanceSelectorModel{
 		instances: instances,
 		selected:  make(map[int]struct{}),
 	}
@@ -107,7 +107,7 @@ func selectInstances(instances []InstanceInfo) ([]InstanceInfo, error) {
 	if err != nil {
 		return nil, fmt.Errorf("TUI failed: %v", err)
 	}
-	m = finalModel.(instanceSelectorModel)
+	m = finalModel.(*instanceSelectorModel)
 
 	var selectedInstances []InstanceInfo
 	for i := range m.selected {
